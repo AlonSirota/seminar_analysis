@@ -1,0 +1,16 @@
+[project]
+name = "seminar-analysis"
+version = "0.1.0"
+description = "Reproducible analysis notebook"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "ipykernel>=7.2.0",
+    "jupytext>=1.19.1",
+    "nbconvert[webpdf]>=7.17.0",
+    "numpy>=2.4.0",
+    "pandas>=3.0.0",
+    "statsmodels>=0.14.6",
+]
+
+[tool.uv]
+package = false
