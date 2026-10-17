@@ -8,6 +8,8 @@
 # %%
 from pathlib import Path
 import urllib.request
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
@@ -142,9 +144,16 @@ metrics = {
     "log_days_first_merged": "Active Tenure (ln(Days + 1))",
 }
 
+axis_labels = {
+    "log_prior_merged_prs": "Prior merged PRs",
+    "log_days_first_merged": "Active tenure (days)",
+}
+
 rows = []
+models = {}
 for col, label in metrics.items():
     m = smf.ols(f"is_bug ~ is_ai * {col}", data=rq3).fit()
+    models[col] = m
     t_ai = m.t_test(f"{col} + is_ai:{col} = 0")
     inter = f"is_ai:{col}"
 
@@ -158,3 +167,33 @@ for col, label in metrics.items():
     )
 
 print(pd.DataFrame(rows).to_string(index=False))
+
+# %% [markdown]
+# ## 4. Visualize experience slopes with and without AI
+#
+# Each graph shows the fitted bug-inducing rate from the corresponding interaction model. Because the models are linear in $\ln(\mathrm{experience} + 1)$, the horizontal axes use logarithmic spacing. Tick labels are converted back to actual PR counts and days.
+
+# %%
+colors = {"Without AI": "#4C78A8", "With AI": "#E45756"}
+
+for col, label in metrics.items():
+    log_x = np.linspace(rq3[col].min(), rq3[col].max(), 200)
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for is_ai, group_label in [(0, "Without AI"), (1, "With AI")]:
+        predictions = models[col].predict(pd.DataFrame({col: log_x, "is_ai": is_ai}))
+        ax.plot(log_x, predictions, linewidth=2.5, color=colors[group_label], label=group_label)
+
+    ax.xaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda value, _position: f"{np.expm1(value):,.0f}")
+    )
+
+    ax.set(
+        title=f"Experience and Predicted Bug-Inducing Rate\n{axis_labels[col]}",
+        xlabel=axis_labels[col],
+        ylabel="Predicted bug-inducing rate (%)",
+    )
+    ax.legend(title="PR type", frameon=False)
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    plt.show()
