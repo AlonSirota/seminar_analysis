@@ -197,3 +197,164 @@ for col, label in metrics.items():
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
     plt.show()
+
+# %% [markdown]
+# ## 5. Logistic interaction regressions
+#
+# Logistic regression models the probability that a PR is bug-inducing. The specification is the same as above:
+#
+# $\operatorname{logit}(P(\text{bug})) = \beta_0 + \beta_1\,\text{is\_ai} + \beta_2\,\text{Exp} + \beta_3\,(\text{is\_ai} \times \text{Exp})$
+#
+# Odds ratios below describe the multiplicative change in bug-inducing odds for a one-unit increase in $\ln(\mathrm{experience} + 1)$. The interaction odds ratio tests whether that experience effect differs between PRs with and without AI. McFadden's pseudo-$R^2$ summarizes overall model fit relative to an intercept-only model.
+
+# %%
+rq3["is_bug_binary"] = (rq3["is_bug"] > 0).astype(int)
+
+logit_rows = []
+logit_models = {}
+
+for col, label in metrics.items():
+    m = smf.logit(f"is_bug_binary ~ is_ai * {col}", data=rq3).fit(disp=False)
+    logit_models[col] = m
+
+    ai_effect = m.t_test(f"{col} + is_ai:{col} = 0")
+    ai_log_odds = ai_effect.effect.item()
+    interaction = f"is_ai:{col}"
+    without_ai_ci = np.exp(m.conf_int().loc[col].to_numpy())
+    with_ai_ci = np.exp(np.asarray(ai_effect.conf_int()).ravel())
+    interaction_ci = np.exp(m.conf_int().loc[interaction].to_numpy())
+
+    logit_rows.append(
+        {
+            "Metric": label,
+            "Without AI OR [95% CI]": (
+                f"{np.exp(m.params[col]):.3f} "
+                f"[{without_ai_ci[0]:.3f}, {without_ai_ci[1]:.3f}] "
+                f"(p={m.pvalues[col]:.4f})"
+            ),
+            "With AI OR [95% CI]": (
+                f"{np.exp(ai_log_odds):.3f} "
+                f"[{with_ai_ci[0]:.3f}, {with_ai_ci[1]:.3f}] "
+                f"(p={ai_effect.pvalue.item():.4f})"
+            ),
+            "Interaction OR [95% CI]": (
+                f"{np.exp(m.params[interaction]):.3f} "
+                f"[{interaction_ci[0]:.3f}, {interaction_ci[1]:.3f}] "
+                f"(p={m.pvalues[interaction]:.4f})"
+            ),
+            "McFadden R²": f"{m.prsquared:.4f}",
+        }
+    )
+
+print(pd.DataFrame(logit_rows).to_string(index=False))
+
+# %% [markdown]
+# **Interpretation.** Neither experience measure significantly predicts bug-inducing odds for PRs without AI. For PRs with AI, greater prior-PR experience and longer active tenure are both associated with significantly lower bug-inducing odds. The AI interaction is significant for active tenure ($p = 0.0133$), but not for prior merged PRs at the 0.05 level ($p = 0.0787$). The low McFadden pseudo-$R^2$ values (0.0100 and 0.0136) indicate that these small models have limited overall predictive power despite some statistically significant effects.
+
+# %% [markdown]
+# ## 6. Visualize logistic-regression predictions
+#
+# The curves show each model's predicted probability that a PR is bug-inducing. Shaded regions are 95% confidence intervals for the mean prediction. Horizontal-axis spacing follows $\ln(\mathrm{experience} + 1)$, while the tick labels show actual PR counts and days.
+
+# %%
+for col in metrics:
+    log_x = np.linspace(rq3[col].min(), rq3[col].max(), 200)
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for is_ai, group_label in [(0, "Without AI"), (1, "With AI")]:
+        prediction_data = pd.DataFrame({col: log_x, "is_ai": is_ai})
+        prediction = logit_models[col].get_prediction(prediction_data).summary_frame()
+        if is_ai == 0:
+            effect_pvalue = logit_models[col].pvalues[col]
+        else:
+            effect_pvalue = logit_models[col].t_test(
+                f"{col} + is_ai:{col} = 0"
+            ).pvalue.item()
+
+        ax.plot(
+            log_x,
+            100 * prediction["predicted"],
+            linewidth=2.5,
+            color=colors[group_label],
+            label=f"{group_label} (experience effect p={effect_pvalue:.3f})",
+        )
+        ax.fill_between(
+            log_x,
+            100 * prediction["ci_lower"],
+            100 * prediction["ci_upper"],
+            color=colors[group_label],
+            alpha=0.15,
+        )
+
+    ax.xaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda value, _position: f"{np.expm1(value):,.0f}")
+    )
+    interaction = f"is_ai:{col}"
+    ax.set(
+        title=(
+            f"Predicted Bug-Inducing Probability\n{axis_labels[col]}\n"
+            f"AI × experience interaction: p={logit_models[col].pvalues[interaction]:.3f}"
+        ),
+        xlabel=axis_labels[col],
+        ylabel="Predicted probability (%)",
+    )
+    ax.set_ylim(bottom=0)
+    ax.legend(title="PR type", frameon=False)
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    plt.show()
+
+# %% [markdown]
+# ## 7. Visualize the interaction contrast
+#
+# These contrast plots show the model-predicted difference in bug-inducing probability between otherwise equivalent PRs with and without AI. A changing difference across experience indicates an interaction on the probability scale. The shaded regions are approximate 95% confidence intervals; the horizontal line marks no predicted AI/non-AI difference.
+
+# %%
+for col in metrics:
+    model = logit_models[col]
+    log_x = np.linspace(rq3[col].min(), rq3[col].max(), 200)
+    interaction = f"is_ai:{col}"
+
+    without_ai_data = pd.DataFrame({col: log_x, "is_ai": 0})
+    with_ai_data = pd.DataFrame({col: log_x, "is_ai": 1})
+    without_ai_probability = model.predict(without_ai_data)
+    with_ai_probability = model.predict(with_ai_data)
+    probability_difference = with_ai_probability - without_ai_probability
+
+    without_ai_design = pd.DataFrame(
+        {"Intercept": 1.0, "is_ai": 0.0, col: log_x, interaction: 0.0}
+    )[model.params.index].to_numpy()
+    with_ai_design = pd.DataFrame(
+        {"Intercept": 1.0, "is_ai": 1.0, col: log_x, interaction: log_x}
+    )[model.params.index].to_numpy()
+    gradient = (
+        with_ai_probability.to_numpy()[:, None]
+        * (1 - with_ai_probability.to_numpy()[:, None])
+        * with_ai_design
+        - without_ai_probability.to_numpy()[:, None]
+        * (1 - without_ai_probability.to_numpy()[:, None])
+        * without_ai_design
+    )
+    covariance = model.cov_params().to_numpy()
+    standard_error = np.sqrt(np.einsum("ij,jk,ik->i", gradient, covariance, gradient))
+    lower = probability_difference - 1.96 * standard_error
+    upper = probability_difference + 1.96 * standard_error
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(log_x, 100 * probability_difference, color="#725AC1", linewidth=2.5)
+    ax.fill_between(log_x, 100 * lower, 100 * upper, color="#725AC1", alpha=0.18)
+    ax.axhline(0, color="black", linewidth=1, linestyle="--")
+    ax.xaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda value, _position: f"{np.expm1(value):,.0f}")
+    )
+    ax.set(
+        title=(
+            f"Predicted AI − Non-AI Probability Difference\n{axis_labels[col]}\n"
+            f"Log-odds interaction test: p={model.pvalues[interaction]:.3f}"
+        ),
+        xlabel=axis_labels[col],
+        ylabel="Probability difference (percentage points)",
+    )
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    plt.show()
