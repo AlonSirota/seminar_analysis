@@ -132,11 +132,37 @@ rq3["repository"] = rq3["pr_url"].str.extract(PR_URL_RE)[0].str.lower()
 if rq3["repository"].isna().any():
     raise ValueError("Could not extract a repository from every PR URL")
 
-print(
-    f"N = {len(rq3)} PRs "
-    f"(Human: {(rq3['is_ai'] == 0).sum()}, AI: {(rq3['is_ai'] == 1).sum()}); "
-    f"{rq3['repository'].nunique()} repository clusters"
-)
+# %% [markdown]
+# ## Bug-labeled cohort composition
+#
+# The paper's initial 539 repositories are not the population represented by this
+# table. That number was obtained after the initial AIDev language and popularity
+# filters. Validation reduced it to 489 unique repositories with at least one
+# qualifying agentic PR (Table 1). The RQ3 authors then retained merged PRs,
+# balanced agentic and human PRs within repository quarters, and excluded quarters
+# that contained only one group. Their released bug-labeled CSV contains 171
+# repositories across all five agents. Our analysis additionally excludes Copilot
+# and Devin, leaving 106 unique repositories for Claude, Codex, and Cursor. The
+# paper does not provide a repository-level attrition table, so the exact reduction
+# from 489 to 171 cannot be decomposed further from the paper alone.
+
+# %%
+bug_labels = pd.read_csv(bug_csv, usecols=["pr_url"])
+bug_label_repositories = bug_labels["pr_url"].str.extract(PR_URL_RE)[0].str.lower()
+human_prs = (rq3["pr_type"] == "HM").sum()
+agentic_bot_prs = ((rq3["pr_type"] == "AM") & (rq3["pr_usertype"] == "Bot")).sum()
+agentic_non_bot_prs = ((rq3["pr_type"] == "AM") & (rq3["pr_usertype"] != "Bot")).sum()
+
+print("Released bug-label CSV")
+print(f"  Total PRs across all five agents: {len(bug_labels):,}")
+print(f"  Unique repositories across all five agents: {bug_label_repositories.nunique():,}")
+print()
+print("Bug-labeled cohort composition (Claude, Codex, and Cursor)")
+print(f"  Total PRs: {len(rq3):,}")
+print(f"  Human-generated PRs (HM): {human_prs:,}")
+print(f"  Agentic PRs authored by bot accounts: {agentic_bot_prs:,}")
+print(f"  Agentic PRs authored by non-bot accounts: {agentic_non_bot_prs:,}")
+print(f"  Unique repositories: {rq3['repository'].nunique():,}")
 
 # %% [markdown]
 # ## Logistic interaction regressions
