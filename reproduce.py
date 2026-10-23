@@ -32,9 +32,9 @@ def get_csv(url, filename):
 
 
 # %% [markdown]
-# ## 1. Download dataset files
+# ## Download dataset files
 #
-# We exclude `copilot` and `devin` because their PRs are authored by bot accounts (`Copilot` and `devin-ai-integration[bot]`), so we can't track the underlying developer's prior PR history.
+# We exclude `copilot` and `devin` because their PRs are generally authored by bot accounts (`Copilot` and `devin-ai-integration[bot]`), so we can't track the underlying developer's prior PR history. We retain the complete balanced RQ3 sample for Claude, Codex, and Cursor, including one Claude-labeled PR authored by the `Copilot` bot account.
 
 # %%
 BASE_RAW = "https://raw.githubusercontent.com/mazloomzadeh/AI-Agent-Analysis/main"
@@ -62,9 +62,9 @@ all_prs_csvs = {
 }
 
 # %% [markdown]
-# ## 2. Build cohort and point-in-time experience metrics
+# ## Build cohort and point-in-time experience metrics
 #
-# For each PR in the RQ3 sample ($N = 2,153$), we use the full repo PR history (`all_prs`) to compute two experience metrics strictly before that PR was created:
+# For each PR in the selected RQ3 sample ($N = 2,154$), we use the full repo PR history (`all_prs`) to compute two account-experience metrics strictly before that PR was created:
 # - `log_prior_merged_prs`: $\ln(\text{prior merged PRs by this author in this repo} + 1)$
 # - `log_days_first_merged`: $\ln(\text{days since author's first merged PR} + 1)$
 
@@ -85,7 +85,7 @@ if not cohort_csv.exists():
     )
 
     rq3 = pd.merge(bug_df, info_df, on=["pr_url", "pr_type", "agent"])
-    rq3 = rq3[rq3["agent"].isin(AGENTS) & (rq3["pr_usertype"] == "User")].copy()
+    rq3 = rq3[rq3["agent"].isin(AGENTS)].copy()
     rq3["is_ai"] = (rq3["pr_type"] == "AM").astype(int)
 
     hist_cols = ["pr_url", "repo_fullname", "pr_user", "pr_user_type", "pr_created_date", "pr_merge_user"]
@@ -139,14 +139,15 @@ print(
 )
 
 # %% [markdown]
-# ## 3. OLS interaction regressions
+# ## Logistic interaction regressions
 #
-# Model: $\text{is\_bug} = \beta_0 + \beta_1\,\text{is\_ai} + \beta_2\,\text{Exp} + \beta_3\,(\text{is\_ai} \times \text{Exp})$
-# - Human slope: $\beta_2$
-# - AI slope: $\beta_2 + \beta_3$
-# - Interaction (AI $-$ Human): $\beta_3$
+# Logistic regression models the probability that a PR is bug-inducing:
 #
-# We report conventional p-values and p-values based on repository-clustered standard errors. Clustering allows observations within the same repository to have correlated errors.
+# $\operatorname{logit}(P(\text{bug})) = \beta_0 + \beta_1\,\text{is\_ai} + \beta_2\,\text{Exp} + \beta_3\,(\text{is\_ai} \times \text{Exp})$
+#
+# Odds ratios below describe the multiplicative change in bug-inducing odds for a one-unit increase in $\ln(\mathrm{experience} + 1)$. The interaction odds ratio tests whether that experience effect differs between PRs with and without AI. McFadden's pseudo-$R^2$ summarizes overall model fit relative to an intercept-only model.
+#
+# The 95% confidence intervals and first p-values use conventional standard errors. The second p-values use repository-clustered standard errors, allowing observations within the same repository to have correlated errors.
 
 # %%
 metrics = {
@@ -159,82 +160,6 @@ axis_labels = {
     "log_days_first_merged": "Active tenure (days)",
 }
 
-rows = []
-models = {}
-clustered_models = {}
-for col, label in metrics.items():
-    m = smf.ols(f"is_bug ~ is_ai * {col}", data=rq3).fit()
-    m_clustered = smf.ols(f"is_bug ~ is_ai * {col}", data=rq3).fit(
-        cov_type="cluster", cov_kwds={"groups": rq3["repository"]}
-    )
-    models[col] = m
-    clustered_models[col] = m_clustered
-    t_ai = m.t_test(f"{col} + is_ai:{col} = 0")
-    t_ai_clustered = m_clustered.t_test(f"{col} + is_ai:{col} = 0")
-    inter = f"is_ai:{col}"
-
-    rows.append(
-        {
-            "Metric": label,
-            "Human Slope": (
-                f"{m.params[col]:+.3f} "
-                f"(p={m.pvalues[col]:.4f}; clustered p={m_clustered.pvalues[col]:.4f})"
-            ),
-            "AI Slope": (
-                f"{t_ai.effect.item():+.3f} "
-                f"(p={t_ai.pvalue.item():.4f}; clustered p={t_ai_clustered.pvalue.item():.4f})"
-            ),
-            "Interaction": (
-                f"{m.params[inter]:+.3f} "
-                f"(p={m.pvalues[inter]:.4f}; clustered p={m_clustered.pvalues[inter]:.4f})"
-            ),
-        }
-    )
-
-print(pd.DataFrame(rows).to_string(index=False))
-
-# %% [markdown]
-# ## 4. Visualize experience slopes with and without AI
-#
-# Each graph shows the fitted bug-inducing rate from the corresponding interaction model. Because the models are linear in $\ln(\mathrm{experience} + 1)$, the horizontal axes use logarithmic spacing. Tick labels are converted back to actual PR counts and days.
-
-# %%
-colors = {"Without AI": "#4C78A8", "With AI": "#E45756"}
-
-for col, label in metrics.items():
-    log_x = np.linspace(rq3[col].min(), rq3[col].max(), 200)
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    for is_ai, group_label in [(0, "Without AI"), (1, "With AI")]:
-        predictions = models[col].predict(pd.DataFrame({col: log_x, "is_ai": is_ai}))
-        ax.plot(log_x, predictions, linewidth=2.5, color=colors[group_label], label=group_label)
-
-    ax.xaxis.set_major_formatter(
-        mticker.FuncFormatter(lambda value, _position: f"{np.expm1(value):,.0f}")
-    )
-
-    ax.set(
-        title=f"Experience and Predicted Bug-Inducing Rate\n{axis_labels[col]}",
-        xlabel=axis_labels[col],
-        ylabel="Predicted bug-inducing rate (%)",
-    )
-    ax.legend(title="PR type", frameon=False)
-    ax.grid(axis="y", alpha=0.25)
-    fig.tight_layout()
-    plt.show()
-
-# %% [markdown]
-# ## 5. Logistic interaction regressions
-#
-# Logistic regression models the probability that a PR is bug-inducing. The specification is the same as above:
-#
-# $\operatorname{logit}(P(\text{bug})) = \beta_0 + \beta_1\,\text{is\_ai} + \beta_2\,\text{Exp} + \beta_3\,(\text{is\_ai} \times \text{Exp})$
-#
-# Odds ratios below describe the multiplicative change in bug-inducing odds for a one-unit increase in $\ln(\mathrm{experience} + 1)$. The interaction odds ratio tests whether that experience effect differs between PRs with and without AI. McFadden's pseudo-$R^2$ summarizes overall model fit relative to an intercept-only model.
-#
-# The 95% confidence intervals and first p-values use conventional standard errors. The second p-values use repository-clustered standard errors.
-
-# %%
 rq3["is_bug_binary"] = (rq3["is_bug"] > 0).astype(int)
 
 logit_rows = []
@@ -286,14 +211,16 @@ for col, label in metrics.items():
 print(pd.DataFrame(logit_rows).to_string(index=False))
 
 # %% [markdown]
-# **Interpretation.** With conventional standard errors, greater prior-PR experience and longer active tenure significantly predict lower bug-inducing odds for PRs with AI. After clustering by repository, neither with-AI experience effect remains below the 0.05 threshold (prior PRs: $p = 0.1923$; active tenure: $p = 0.0576$). The active-tenure interaction remains significant with clustered standard errors ($p = 0.0187$), while the prior-PR interaction does not ($p = 0.1335$). Neither experience measure significantly predicts bug-inducing odds for PRs without AI under either inference method. The low McFadden pseudo-$R^2$ values (0.0100 and 0.0136) indicate that these small models have limited overall predictive power.
+# **Interpretation.** With conventional standard errors, greater prior-PR experience and longer active tenure significantly predict lower bug-inducing odds for PRs with AI. After clustering by repository, neither with-AI experience effect remains below the 0.05 threshold (prior PRs: $p = 0.1892$; active tenure: $p = 0.0570$). The active-tenure interaction remains significant with clustered standard errors ($p = 0.0183$), while the prior-PR interaction does not ($p = 0.1307$). Neither experience measure significantly predicts bug-inducing odds for PRs without AI under either inference method. The low McFadden pseudo-$R^2$ values (0.0101 and 0.0137) indicate that these small models have limited overall predictive power.
 
 # %% [markdown]
-# ## 6. Visualize logistic-regression predictions
+# ## Visualize logistic-regression predictions
 #
 # The curves show each model's predicted probability that a PR is bug-inducing. Shaded regions are 95% confidence intervals for the mean prediction based on repository-clustered standard errors. Horizontal-axis spacing follows $\ln(\mathrm{experience} + 1)$, while the tick labels show actual PR counts and days.
 
 # %%
+colors = {"Without AI": "#4C78A8", "With AI": "#E45756"}
+
 for col in metrics:
     model = logit_models[col]
     clustered_model = clustered_logit_models[col]
@@ -350,7 +277,7 @@ for col in metrics:
     plt.show()
 
 # %% [markdown]
-# ## 7. Visualize the interaction contrast
+# ## Visualize the interaction contrast
 #
 # These contrast plots show the model-predicted difference in bug-inducing probability between otherwise equivalent PRs with and without AI. A changing difference across experience indicates an interaction on the probability scale. The shaded regions are approximate 95% confidence intervals based on repository-clustered standard errors; the horizontal line marks no predicted AI/non-AI difference.
 
