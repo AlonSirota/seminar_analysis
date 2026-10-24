@@ -8,8 +8,6 @@
 # %%
 from pathlib import Path
 import urllib.request
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
@@ -62,11 +60,9 @@ all_prs_csvs = {
 }
 
 # %% [markdown]
-# ## Build cohort and point-in-time experience metrics
+# ## Build cohort and point-in-time experience
 #
-# For each PR in the selected RQ3 sample ($N = 2,154$), we use the full repo PR history (`all_prs`) to compute two account-experience metrics strictly before that PR was created:
-# - `log_prior_merged_prs`: $\ln(\text{prior merged PRs by this author in this repo} + 1)$
-# - `log_days_first_merged`: $\ln(\text{days since author's first merged PR} + 1)$
+# For each PR in the selected RQ3 sample ($N = 2,154$), we use the full repo PR history (`all_prs`) to count the author's merged PRs in that repository strictly before the selected PR was created.
 
 # %%
 cohort_csv = DATA_DIR / "rq3_cohort.csv"
@@ -111,16 +107,10 @@ if not cohort_csv.exists():
     )
     unique_prs["log_prior_merged_prs"] = np.log(unique_prs["prior_merged_prs"] + 1)
 
-    # Days since author's first merged PR
-    first_merged = unique_prs[unique_prs["is_merged"] == 1].groupby("user_lower")["pr_created_dt"].min()
-    days_elapsed = (unique_prs["pr_created_dt"] - unique_prs["user_lower"].map(first_merged)).dt.total_seconds() / 86400
-    unique_prs["days_since_first_merged"] = np.maximum(0.0, days_elapsed.fillna(0.0))
-    unique_prs["log_days_first_merged"] = np.log(unique_prs["days_since_first_merged"] + 1)
-
     rq3_ext = rq3["pr_url"].str.extract(PR_URL_RE)
     rq3["pr_key"] = rq3_ext[0].str.lower() + "#" + rq3_ext[1]
     rq3 = rq3.merge(
-        unique_prs[["pr_key", "log_prior_merged_prs", "log_days_first_merged"]],
+        unique_prs[["pr_key", "prior_merged_prs", "log_prior_merged_prs"]],
         on="pr_key",
         how="left",
     )
@@ -128,6 +118,11 @@ if not cohort_csv.exists():
     rq3.to_csv(cohort_csv, index=False)
 
 rq3 = pd.read_csv(cohort_csv)
+if "prior_merged_prs" not in rq3:
+    # Support cohort files cached before the raw count was retained.
+    rq3["prior_merged_prs"] = np.rint(
+        np.expm1(rq3["log_prior_merged_prs"])
+    ).astype(int)
 rq3["repository"] = rq3["pr_url"].str.extract(PR_URL_RE)[0].str.lower()
 if rq3["repository"].isna().any():
     raise ValueError("Could not extract a repository from every PR URL")
@@ -165,196 +160,51 @@ print(f"  Agentic PRs authored by non-bot accounts: {agentic_non_bot_prs:,}")
 print(f"  Unique repositories: {rq3['repository'].nunique():,}")
 
 # %% [markdown]
-# ## Logistic interaction regressions
+# ## Simplified interaction model with raw experience
 #
-# Logistic regression models the probability that a PR is bug-inducing:
-#
-# $\operatorname{logit}(P(\text{bug})) = \beta_0 + \beta_1\,\text{is\_ai} + \beta_2\,\text{Exp} + \beta_3\,(\text{is\_ai} \times \text{Exp})$
-#
-# Odds ratios below describe the multiplicative change in bug-inducing odds for a one-unit increase in $\ln(\mathrm{experience} + 1)$. The interaction odds ratio tests whether that experience effect differs between PRs with and without AI. McFadden's pseudo-$R^2$ summarizes overall model fit relative to an intercept-only model.
-#
-# The 95% confidence intervals and first p-values use conventional standard errors. The second p-values use repository-clustered standard errors, allowing observations within the same repository to have correlated errors.
+# Logistic regression tests whether the association between prior merged PRs and bug-inducing status differs between PRs with and without AI. Dividing experience by 100 makes the coefficient the change in log-odds associated with 100 additional prior merged PRs. This specification assumes a linear effect of the raw PR count and uses conventional standard errors.
 
 # %%
-metrics = {
-    "log_prior_merged_prs": "Prior Merged PRs (ln(PRs + 1))",
-    "log_days_first_merged": "Active Tenure (ln(Days + 1))",
-}
+simple_df = rq3.copy()
+simple_df["is_ai"] = simple_df["is_ai"].astype(int)
+simple_df["is_bug"] = (simple_df["is_bug"] > 0).astype(int)
 
-axis_labels = {
-    "log_prior_merged_prs": "Prior merged PRs",
-    "log_days_first_merged": "Active tenure (days)",
-}
+simple_df["experience"] = simple_df["prior_merged_prs"]
+simple_df["experience_100"] = simple_df["experience"] / 100
 
-rq3["is_bug_binary"] = (rq3["is_bug"] > 0).astype(int)
+simple_model = smf.logit(
+    "is_bug ~ is_ai * experience_100",
+    data=simple_df,
+).fit(disp=False)
 
-logit_rows = []
-logit_models = {}
-clustered_logit_models = {}
-
-for col, label in metrics.items():
-    m = smf.logit(f"is_bug_binary ~ is_ai * {col}", data=rq3).fit(disp=False)
-    m_clustered = smf.logit(f"is_bug_binary ~ is_ai * {col}", data=rq3).fit(
-        disp=False,
-        cov_type="cluster",
-        cov_kwds={"groups": rq3["repository"]},
-    )
-    logit_models[col] = m
-    clustered_logit_models[col] = m_clustered
-
-    ai_effect = m.t_test(f"{col} + is_ai:{col} = 0")
-    ai_effect_clustered = m_clustered.t_test(f"{col} + is_ai:{col} = 0")
-    ai_log_odds = ai_effect.effect.item()
-    interaction = f"is_ai:{col}"
-    without_ai_ci = np.exp(m.conf_int().loc[col].to_numpy())
-    with_ai_ci = np.exp(np.asarray(ai_effect.conf_int()).ravel())
-    interaction_ci = np.exp(m.conf_int().loc[interaction].to_numpy())
-
-    logit_rows.append(
-        {
-            "Metric": label,
-            "Without AI OR [95% CI]": (
-                f"{np.exp(m.params[col]):.3f} "
-                f"[{without_ai_ci[0]:.3f}, {without_ai_ci[1]:.3f}] "
-                f"(p={m.pvalues[col]:.4f}; clustered p={m_clustered.pvalues[col]:.4f})"
-            ),
-            "With AI OR [95% CI]": (
-                f"{np.exp(ai_log_odds):.3f} "
-                f"[{with_ai_ci[0]:.3f}, {with_ai_ci[1]:.3f}] "
-                f"(p={ai_effect.pvalue.item():.4f}; "
-                f"clustered p={ai_effect_clustered.pvalue.item():.4f})"
-            ),
-            "Interaction OR [95% CI]": (
-                f"{np.exp(m.params[interaction]):.3f} "
-                f"[{interaction_ci[0]:.3f}, {interaction_ci[1]:.3f}] "
-                f"(p={m.pvalues[interaction]:.4f}; "
-                f"clustered p={m_clustered.pvalues[interaction]:.4f})"
-            ),
-            "McFadden R²": f"{m.prsquared:.4f}",
-        }
-    )
-
-print(pd.DataFrame(logit_rows).to_string(index=False))
+term = "is_ai:experience_100"
+print("Interaction coefficient:", simple_model.params[term])
+print("95% confidence interval:", simple_model.conf_int().loc[term].tolist())
+print("p-value:", simple_model.pvalues[term])
 
 # %% [markdown]
-# **Interpretation.** With conventional standard errors, greater prior-PR experience and longer active tenure significantly predict lower bug-inducing odds for PRs with AI. After clustering by repository, neither with-AI experience effect remains below the 0.05 threshold (prior PRs: $p = 0.1892$; active tenure: $p = 0.0570$). The active-tenure interaction remains significant with clustered standard errors ($p = 0.0183$), while the prior-PR interaction does not ($p = 0.1307$). Neither experience measure significantly predicts bug-inducing odds for PRs without AI under either inference method. The low McFadden pseudo-$R^2$ values (0.0101 and 0.0137) indicate that these small models have limited overall predictive power.
+# **Interpretation.** The estimated interaction is $-0.189$ log-odds per 100 additional prior merged PRs (95% CI $[-0.475, 0.096]$, $p = 0.193$). Because the confidence interval includes zero, this simpler raw-count specification does not provide statistically significant evidence that the association between experience and bug-inducing status differs between PRs with and without AI.
 
 # %% [markdown]
-# ## Visualize logistic-regression predictions
+# ## Simplified interaction model with log-transformed experience
 #
-# The curves show each model's predicted probability that a PR is bug-inducing. Shaded regions are 95% confidence intervals for the mean prediction based on repository-clustered standard errors. Horizontal-axis spacing follows $\ln(\mathrm{experience} + 1)$, while the tick labels show actual PR counts and days.
+# This model changes only the experience variable from the preceding model. It uses $\ln(\text{prior merged PRs} + 1)$, while retaining the same binary outcome, interaction formula, and conventional standard errors. This makes the raw-count and log-transformed specifications directly comparable.
 
 # %%
-colors = {"Without AI": "#4C78A8", "With AI": "#E45756"}
+log_experience_df = rq3.copy()
+log_experience_df["is_ai"] = log_experience_df["is_ai"].astype(int)
+log_experience_df["is_bug"] = (log_experience_df["is_bug"] > 0).astype(int)
+log_experience_df["experience"] = log_experience_df["log_prior_merged_prs"]
 
-for col in metrics:
-    model = logit_models[col]
-    clustered_model = clustered_logit_models[col]
-    log_x = np.linspace(rq3[col].min(), rq3[col].max(), 200)
-    fig, ax = plt.subplots(figsize=(8, 5))
+log_experience_model = smf.logit(
+    "is_bug ~ is_ai * experience",
+    data=log_experience_df,
+).fit(disp=False)
 
-    for is_ai, group_label in [(0, "Without AI"), (1, "With AI")]:
-        prediction_data = pd.DataFrame({col: log_x, "is_ai": is_ai})
-        prediction = clustered_model.get_prediction(prediction_data).summary_frame()
-        if is_ai == 0:
-            effect_pvalue = model.pvalues[col]
-            clustered_effect_pvalue = clustered_model.pvalues[col]
-        else:
-            effect_pvalue = model.t_test(f"{col} + is_ai:{col} = 0").pvalue.item()
-            clustered_effect_pvalue = clustered_model.t_test(
-                f"{col} + is_ai:{col} = 0"
-            ).pvalue.item()
-
-        ax.plot(
-            log_x,
-            100 * prediction["predicted"],
-            linewidth=2.5,
-            color=colors[group_label],
-            label=(
-                f"{group_label} (p={effect_pvalue:.3f}; "
-                f"clustered p={clustered_effect_pvalue:.3f})"
-            ),
-        )
-        ax.fill_between(
-            log_x,
-            100 * prediction["ci_lower"],
-            100 * prediction["ci_upper"],
-            color=colors[group_label],
-            alpha=0.15,
-        )
-
-    ax.xaxis.set_major_formatter(
-        mticker.FuncFormatter(lambda value, _position: f"{np.expm1(value):,.0f}")
-    )
-    interaction = f"is_ai:{col}"
-    ax.set(
-        title=(
-            f"Predicted Bug-Inducing Probability\n{axis_labels[col]}\n"
-            f"AI × experience interaction: p={model.pvalues[interaction]:.3f}; "
-            f"clustered p={clustered_model.pvalues[interaction]:.3f}"
-        ),
-        xlabel=axis_labels[col],
-        ylabel="Predicted probability (%)",
-    )
-    ax.set_ylim(bottom=0)
-    ax.legend(title="PR type", frameon=False)
-    ax.grid(axis="y", alpha=0.25)
-    fig.tight_layout()
-    plt.show()
+term = "is_ai:experience"
+print("Interaction coefficient:", log_experience_model.params[term])
+print("95% confidence interval:", log_experience_model.conf_int().loc[term].tolist())
+print("p-value:", log_experience_model.pvalues[term])
 
 # %% [markdown]
-# ## Visualize the interaction contrast
-#
-# These contrast plots show the model-predicted difference in bug-inducing probability between otherwise equivalent PRs with and without AI. A changing difference across experience indicates an interaction on the probability scale. The shaded regions are approximate 95% confidence intervals based on repository-clustered standard errors; the horizontal line marks no predicted AI/non-AI difference.
-
-# %%
-for col in metrics:
-    model = logit_models[col]
-    clustered_model = clustered_logit_models[col]
-    log_x = np.linspace(rq3[col].min(), rq3[col].max(), 200)
-    interaction = f"is_ai:{col}"
-
-    without_ai_data = pd.DataFrame({col: log_x, "is_ai": 0})
-    with_ai_data = pd.DataFrame({col: log_x, "is_ai": 1})
-    without_ai_probability = model.predict(without_ai_data)
-    with_ai_probability = model.predict(with_ai_data)
-    probability_difference = with_ai_probability - without_ai_probability
-
-    without_ai_design = pd.DataFrame(
-        {"Intercept": 1.0, "is_ai": 0.0, col: log_x, interaction: 0.0}
-    )[model.params.index].to_numpy()
-    with_ai_design = pd.DataFrame(
-        {"Intercept": 1.0, "is_ai": 1.0, col: log_x, interaction: log_x}
-    )[model.params.index].to_numpy()
-    gradient = (
-        with_ai_probability.to_numpy()[:, None]
-        * (1 - with_ai_probability.to_numpy()[:, None])
-        * with_ai_design
-        - without_ai_probability.to_numpy()[:, None]
-        * (1 - without_ai_probability.to_numpy()[:, None])
-        * without_ai_design
-    )
-    covariance = clustered_model.cov_params().to_numpy()
-    standard_error = np.sqrt(np.einsum("ij,jk,ik->i", gradient, covariance, gradient))
-    lower = probability_difference - 1.96 * standard_error
-    upper = probability_difference + 1.96 * standard_error
-
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(log_x, 100 * probability_difference, color="#725AC1", linewidth=2.5)
-    ax.fill_between(log_x, 100 * lower, 100 * upper, color="#725AC1", alpha=0.18)
-    ax.axhline(0, color="black", linewidth=1, linestyle="--")
-    ax.xaxis.set_major_formatter(
-        mticker.FuncFormatter(lambda value, _position: f"{np.expm1(value):,.0f}")
-    )
-    ax.set(
-        title=(
-            f"Predicted AI − Non-AI Probability Difference\n{axis_labels[col]}\n"
-            f"Log-odds interaction: p={model.pvalues[interaction]:.3f}; "
-            f"clustered p={clustered_model.pvalues[interaction]:.3f}"
-        ),
-        xlabel=axis_labels[col],
-        ylabel="Probability difference (percentage points)",
-    )
-    ax.grid(axis="y", alpha=0.25)
-    fig.tight_layout()
-    plt.show()
+# **Interpretation.** The estimated interaction is $-0.157$ log-odds per one-unit increase in $\ln(\text{prior merged PRs} + 1)$ (95% CI $[-0.330, 0.017]$, $p = 0.077$). The estimate is closer to the conventional significance threshold than the raw-count estimate, but its confidence interval still includes zero.
