@@ -1,5 +1,5 @@
 # %% [markdown]
-# # Developer Experience vs. Bug-Inducing Rate in AI-Assisted PRs
+# # Developer Experience vs. Bug-Inducing Rate in Agentic PRs
 #
 # Secondary analysis on the RQ3 dataset from Mazloomzadeh et al. ([arXiv:2607.21832](https://arxiv.org/abs/2607.21832), [GitHub repo](https://github.com/mazloomzadeh/AI-Agent-Analysis)).
 #
@@ -108,7 +108,7 @@ if not cohort_csv.exists():
 
     rq3 = pd.merge(bug_df, info_df, on=["pr_url", "pr_type", "agent"])
     rq3 = rq3[rq3["agent"].isin(AGENTS)].copy()
-    rq3["is_ai"] = (rq3["pr_type"] == "AM").astype(int)
+    rq3["is_agentic"] = (rq3["pr_type"] == "AM").astype(int)
 
     hist_cols = [
         "pr_url",
@@ -137,12 +137,11 @@ if not cohort_csv.exists():
 
     # Merges completed before this PR was created, excluding the current PR.
     unique_prs["prior_merged_prs"] = count_prior_merged_prs(unique_prs)
-    unique_prs["log_prior_merged_prs"] = np.log(unique_prs["prior_merged_prs"] + 1)
 
     rq3_ext = rq3["pr_url"].str.extract(PR_URL_RE)
     rq3["pr_key"] = rq3_ext[0].str.lower() + "#" + rq3_ext[1]
     rq3 = rq3.merge(
-        unique_prs[["pr_key", "prior_merged_prs", "log_prior_merged_prs"]],
+        unique_prs[["pr_key", "prior_merged_prs"]],
         on="pr_key",
         how="left",
     )
@@ -150,6 +149,7 @@ if not cohort_csv.exists():
     rq3.to_csv(cohort_csv, index=False)
 
 rq3 = pd.read_csv(cohort_csv)
+rq3["is_agentic"] = (rq3["pr_type"] == "AM").astype(int)
 rq3["repository"] = rq3["pr_url"].str.extract(PR_URL_RE)[0].str.lower()
 if rq3["repository"].isna().any():
     raise ValueError("Could not extract a repository from every PR URL")
@@ -187,155 +187,84 @@ print(f"  Agentic PRs authored by non-bot accounts: {agentic_non_bot_prs:,}")
 print(f"  Unique repositories: {rq3['repository'].nunique():,}")
 
 # %% [markdown]
-# ## Simplified interaction model with raw experience
+# ## Interaction model with raw experience
 #
-# Logistic regression tests whether the association between prior merged PRs and bug-inducing status differs between PRs with and without AI. Dividing experience by 100 makes the coefficient the change in log-odds associated with 100 additional prior merged PRs. This specification assumes a linear effect of the raw PR count and uses conventional standard errors.
+# Logistic regression tests whether the association between prior merged PRs and bug-inducing status differs between agentic and human PRs. Experience is the raw number of prior merged PRs, so its coefficient is the change in log-odds associated with one additional prior merged PR. This specification assumes a linear effect of the raw PR count and uses conventional standard errors.
 
 # %%
 simple_df = rq3.copy()
-simple_df["is_ai"] = simple_df["is_ai"].astype(int)
+simple_df["is_agentic"] = simple_df["is_agentic"].astype(int)
 simple_df["is_bug"] = (simple_df["is_bug"] > 0).astype(int)
 
 simple_df["experience"] = simple_df["prior_merged_prs"]
-simple_df["experience_100"] = simple_df["experience"] / 100
 
-simple_model = smf.logit(
-    "is_bug ~ is_ai * experience_100",
+raw_experience_model = smf.logit(
+    "is_bug ~ is_agentic * experience",
     data=simple_df,
 ).fit(disp=False)
 
-term = "is_ai:experience_100"
-print("Interaction coefficient:", simple_model.params[term])
-print("95% confidence interval:", simple_model.conf_int().loc[term].tolist())
-print("p-value:", simple_model.pvalues[term])
+term = "is_agentic:experience"
+print("Interaction coefficient:", raw_experience_model.params[term])
+print("95% confidence interval:", raw_experience_model.conf_int().loc[term].tolist())
+print("p-value:", raw_experience_model.pvalues[term])
 
 # %% [markdown]
-# **Interpretation.** The estimated interaction is $-0.192$ log-odds per 100 additional prior merged PRs (95% CI $[-0.475, 0.092]$, $p = 0.185$). Because the confidence interval includes zero, this simpler raw-count specification does not provide statistically significant evidence that the association between experience and bug-inducing status differs between PRs with and without AI.
+# **Interpretation.** The estimated interaction is $-0.0019$ log-odds per additional prior merged PR (95% CI $[-0.0048, 0.0009]$, $p = 0.185$). Because the confidence interval includes zero, the raw-count specification does not provide statistically significant evidence that the association between experience and bug-inducing status differs between agentic and human PRs.
 
 # %% [markdown]
-# ## Simplified interaction model with log-transformed experience
+# ## Predicted probabilities for agentic and human PRs
 #
-# This model changes only the experience variable from the preceding model. It uses $\ln(\text{prior merged PRs} + 1)$, while retaining the same binary outcome, interaction formula, and conventional standard errors. This makes the raw-count and log-transformed specifications directly comparable.
+# The plot shows predictions from the raw-count interaction model with 95% confidence intervals. It stops at the largest experience value observed in both cohorts, avoiding comparisons outside their common observed range.
 
 # %%
-log_experience_df = rq3.copy()
-log_experience_df["is_ai"] = log_experience_df["is_ai"].astype(int)
-log_experience_df["is_bug"] = (log_experience_df["is_bug"] > 0).astype(int)
-log_experience_df["experience"] = log_experience_df["log_prior_merged_prs"]
+max_experience = int(simple_df.groupby("is_agentic")["prior_merged_prs"].max().min())
+experience_grid = np.linspace(0, max_experience, 250)
 
-log_experience_model = smf.logit(
-    "is_bug ~ is_ai * experience",
-    data=log_experience_df,
-).fit(disp=False)
-
-term = "is_ai:experience"
-print("Interaction coefficient:", log_experience_model.params[term])
-print("95% confidence interval:", log_experience_model.conf_int().loc[term].tolist())
-print("p-value:", log_experience_model.pvalues[term])
-
-# %% [markdown]
-# **Interpretation.** The estimated interaction is $-0.162$ log-odds per one-unit increase in $\ln(\text{prior merged PRs} + 1)$ (95% CI $[-0.333, 0.008]$, $p = 0.062$). The estimate is closer to the conventional significance threshold than the raw-count estimate, but its confidence interval still includes zero.
-
-# %% [markdown]
-# ## Repository-clustered inference
-#
-# The same log-transformed model is fitted with standard errors clustered by repository. This allows PRs from the same repository to have correlated errors. The coefficients remain on the log-odds scale.
-
-# %%
-clustered_model = smf.logit(
-    "is_bug ~ is_ai * experience",
-    data=log_experience_df,
-).fit(
-    disp=False,
-    cov_type="cluster",
-    cov_kwds={"groups": log_experience_df["repository"]},
-)
-
-clustered_rows = []
-tests = {
-    "AI effect at zero prior PRs": "is_ai = 0",
-    "Experience effect without AI": "experience = 0",
-    "Experience effect with AI": "experience + is_ai:experience = 0",
-    "AI × experience interaction": "is_ai:experience = 0",
+fig, ax = plt.subplots(figsize=(7, 5))
+colors = {0: "#4C78A8", 1: "#E45756"}
+human_slope_pvalue = raw_experience_model.pvalues["experience"]
+agentic_slope_pvalue = raw_experience_model.t_test(
+    "experience + is_agentic:experience = 0"
+).pvalue.item()
+labels = {
+    0: f"Human PRs (slope p = {human_slope_pvalue:.3f})",
+    1: f"Agentic PRs (slope p = {agentic_slope_pvalue:.3f})",
 }
 
-for label, hypothesis in tests.items():
-    result = clustered_model.t_test(hypothesis)
-    confidence_interval = result.conf_int().ravel()
-    clustered_rows.append(
+for is_agentic in (0, 1):
+    prediction_data = pd.DataFrame(
         {
-            "Effect": label,
-            "Coefficient": result.effect.item(),
-            "95% CI lower": confidence_interval[0],
-            "95% CI upper": confidence_interval[1],
-            "p-value": result.pvalue.item(),
+            "is_agentic": is_agentic,
+            "experience": experience_grid,
         }
     )
+    prediction = raw_experience_model.get_prediction(prediction_data).summary_frame(alpha=0.05)
 
-clustered_results = pd.DataFrame(clustered_rows)
-print(f"Repositories: {log_experience_df['repository'].nunique()}")
-print(clustered_results.to_string(index=False, float_format=lambda value: f"{value:.3f}"))
-
-# %% [markdown]
-# **Interpretation.** After clustering across 106 repositories, none of the four effects is statistically significant at the 0.05 level. The AI-by-experience interaction is $-0.162$ log-odds (95% CI $[-0.368, 0.044]$, $p = 0.123$). The negative estimate suggests a stronger decline in bug-inducing odds as experience increases for AI-assisted PRs, but the confidence interval includes zero.
-
-# %% [markdown]
-# ## Predicted probabilities with and without repository clustering
-#
-# Both panels show predictions from the same log-transformed interaction model. The left panel uses conventional standard errors; the right panel uses repository-clustered standard errors. Clustering changes the confidence intervals and inference, not the fitted probability lines.
-
-# %%
-max_experience = int(log_experience_df["prior_merged_prs"].max())
-experience_grid = np.unique(
-    np.rint(np.geomspace(1, max_experience + 1, 250) - 1).astype(int)
-)
-
-fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
-colors = {0: "#4C78A8", 1: "#E45756"}
-labels = {0: "Without AI", 1: "With AI"}
-models = [
-    ("Conventional standard errors", log_experience_model),
-    ("Repository-clustered standard errors", clustered_model),
-]
-
-for ax, (title, model) in zip(axes, models):
-    for is_ai in (0, 1):
-        prediction_data = pd.DataFrame(
-            {
-                "is_ai": is_ai,
-                "experience": np.log1p(experience_grid),
-            }
-        )
-        prediction = model.get_prediction(prediction_data).summary_frame(alpha=0.05)
-
-        ax.plot(
-            experience_grid,
-            100 * prediction["predicted"],
-            color=colors[is_ai],
-            linewidth=2.5,
-            label=labels[is_ai],
-        )
-        ax.fill_between(
-            experience_grid,
-            100 * prediction["ci_lower"],
-            100 * prediction["ci_upper"],
-            color=colors[is_ai],
-            alpha=0.18,
-        )
-
-    interaction_pvalue = model.pvalues["is_ai:experience"]
-    ax.set_xscale("symlog", linthresh=1)
-    ax.set(
-        title=f"{title}\ninteraction p = {interaction_pvalue:.3f}",
-        xlabel="Prior merged PRs in the repository (log scale)",
+    ax.plot(
+        experience_grid,
+        100 * prediction["predicted"],
+        color=colors[is_agentic],
+        linewidth=2.5,
+        label=labels[is_agentic],
     )
-    ax.grid(axis="y", alpha=0.25)
+    ax.fill_between(
+        experience_grid,
+        100 * prediction["ci_lower"],
+        100 * prediction["ci_upper"],
+        color=colors[is_agentic],
+        alpha=0.18,
+    )
 
-axes[0].set_ylabel("Predicted probability of a bug-inducing PR (%)")
-axes[0].legend(title="PR type", frameon=False)
-fig.suptitle("AI × Experience Model", fontsize=14)
+interaction_pvalue = raw_experience_model.pvalues["is_agentic:experience"]
+ax.set(
+    title=f"PR Type × Experience Model\ninteraction p = {interaction_pvalue:.3f}",
+    xlabel="Prior merged PRs in the repository",
+    ylabel="Predicted probability of a bug-inducing PR (%)",
+)
+ax.grid(axis="y", alpha=0.25)
+ax.legend(title="PR type", frameon=False)
 fig.tight_layout()
 plt.show()
 
 # %% [markdown]
-# **How to read the plots.** At a given experience level, the vertical gap between the lines is the modeled AI/non-AI difference. Each line's slope shows the modeled association between experience and bug-inducing probability for that PR type. Different slopes represent the interaction. The wider repository-clustered bands reflect correlation among PRs from the same repository. The interaction is not statistically significant with either conventional ($p = 0.062$) or clustered ($p = 0.123$) standard errors.
+# **How to read the plot.** At a given experience level, the vertical gap between the lines is the modeled difference between agentic and human PRs. Each legend p-value tests whether that cohort's experience slope differs from zero. The interaction p-value tests whether the two slopes differ from each other. Neither cohort slope is statistically significant (human PRs: $p = 0.615$; agentic PRs: $p = 0.071$), and the difference between the slopes is also not statistically significant ($p = 0.185$).
