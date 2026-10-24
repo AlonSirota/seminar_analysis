@@ -6,8 +6,10 @@
 # Downloaded files and the merged cohort table are cached in `data_cache/`. Delete a file there if you want to re-download or rebuild it.
 
 # %%
+from bisect import bisect_left
 from pathlib import Path
 import urllib.request
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
@@ -27,6 +29,30 @@ def get_csv(url, filename):
         with urllib.request.urlopen(req, timeout=180) as resp:
             path.write_bytes(resp.read())
     return path
+
+
+def count_prior_merged_prs(pr_history):
+    merged_dates = (
+        pr_history.loc[pr_history["is_merged"].eq(1)]
+        .groupby(["repo_lower", "user_lower"])["pr_closed_dt"]
+        .apply(lambda dates: sorted(dates.dropna().tolist()))
+        .to_dict()
+    )
+
+    # Count only merge timestamps strictly before each PR's creation time.
+    # This excludes the current PR and earlier PRs that had not yet merged.
+    return pd.Series(
+        [
+            bisect_left(merged_dates.get((repo, user), ()), created)
+            for repo, user, created in zip(
+                pr_history["repo_lower"],
+                pr_history["user_lower"],
+                pr_history["pr_created_dt"],
+            )
+        ],
+        index=pr_history.index,
+        dtype=int,
+    )
 
 
 # %% [markdown]
@@ -65,7 +91,7 @@ all_prs_csvs = {
 # For each PR in the selected RQ3 sample ($N = 2,154$), we use the full repo PR history (`all_prs`) to count the author's merged PRs in that repository strictly before the selected PR was created.
 
 # %%
-cohort_csv = DATA_DIR / "rq3_cohort.csv"
+cohort_csv = DATA_DIR / "rq3_cohort_point_in_time.csv"
 
 if not cohort_csv.exists():
     bug_df = pd.read_csv(bug_csv, usecols=["pr_url", "pr_type", "agent", "is_bug_inducing"])
@@ -84,7 +110,15 @@ if not cohort_csv.exists():
     rq3 = rq3[rq3["agent"].isin(AGENTS)].copy()
     rq3["is_ai"] = (rq3["pr_type"] == "AM").astype(int)
 
-    hist_cols = ["pr_url", "repo_fullname", "pr_user", "pr_user_type", "pr_created_date", "pr_merge_user"]
+    hist_cols = [
+        "pr_url",
+        "repo_fullname",
+        "pr_user",
+        "pr_user_type",
+        "pr_created_date",
+        "pr_closed_date",
+        "pr_merge_user",
+    ]
     all_prs = pd.concat([pd.read_csv(all_prs_csvs[a], usecols=hist_cols) for a in AGENTS], ignore_index=True)
 
     ext = all_prs["pr_url"].str.extract(PR_URL_RE)
@@ -92,6 +126,7 @@ if not cohort_csv.exists():
     all_prs["repo_lower"] = all_prs["repo_fullname"].astype(str).str.lower()
     all_prs["user_lower"] = all_prs["pr_user"].astype(str).str.lower()
     all_prs["pr_created_dt"] = pd.to_datetime(all_prs["pr_created_date"], utc=True)
+    all_prs["pr_closed_dt"] = pd.to_datetime(all_prs["pr_closed_date"], utc=True)
     all_prs["is_merged"] = all_prs["pr_merge_user"].notna().astype(int)
 
     unique_prs = (
@@ -100,11 +135,8 @@ if not cohort_csv.exists():
         .reset_index(drop=True)
     )
 
-    # Prior merged PRs in the same repo
-    unique_prs["prior_merged_prs"] = (
-        unique_prs.groupby(["repo_lower", "user_lower"])["is_merged"].cumsum()
-        - unique_prs["is_merged"]
-    )
+    # Merges completed before this PR was created, excluding the current PR.
+    unique_prs["prior_merged_prs"] = count_prior_merged_prs(unique_prs)
     unique_prs["log_prior_merged_prs"] = np.log(unique_prs["prior_merged_prs"] + 1)
 
     rq3_ext = rq3["pr_url"].str.extract(PR_URL_RE)
@@ -118,11 +150,6 @@ if not cohort_csv.exists():
     rq3.to_csv(cohort_csv, index=False)
 
 rq3 = pd.read_csv(cohort_csv)
-if "prior_merged_prs" not in rq3:
-    # Support cohort files cached before the raw count was retained.
-    rq3["prior_merged_prs"] = np.rint(
-        np.expm1(rq3["log_prior_merged_prs"])
-    ).astype(int)
 rq3["repository"] = rq3["pr_url"].str.extract(PR_URL_RE)[0].str.lower()
 if rq3["repository"].isna().any():
     raise ValueError("Could not extract a repository from every PR URL")
@@ -183,7 +210,7 @@ print("95% confidence interval:", simple_model.conf_int().loc[term].tolist())
 print("p-value:", simple_model.pvalues[term])
 
 # %% [markdown]
-# **Interpretation.** The estimated interaction is $-0.189$ log-odds per 100 additional prior merged PRs (95% CI $[-0.475, 0.096]$, $p = 0.193$). Because the confidence interval includes zero, this simpler raw-count specification does not provide statistically significant evidence that the association between experience and bug-inducing status differs between PRs with and without AI.
+# **Interpretation.** The estimated interaction is $-0.192$ log-odds per 100 additional prior merged PRs (95% CI $[-0.475, 0.092]$, $p = 0.185$). Because the confidence interval includes zero, this simpler raw-count specification does not provide statistically significant evidence that the association between experience and bug-inducing status differs between PRs with and without AI.
 
 # %% [markdown]
 # ## Simplified interaction model with log-transformed experience
@@ -207,4 +234,92 @@ print("95% confidence interval:", log_experience_model.conf_int().loc[term].toli
 print("p-value:", log_experience_model.pvalues[term])
 
 # %% [markdown]
-# **Interpretation.** The estimated interaction is $-0.157$ log-odds per one-unit increase in $\ln(\text{prior merged PRs} + 1)$ (95% CI $[-0.330, 0.017]$, $p = 0.077$). The estimate is closer to the conventional significance threshold than the raw-count estimate, but its confidence interval still includes zero.
+# **Interpretation.** The estimated interaction is $-0.162$ log-odds per one-unit increase in $\ln(\text{prior merged PRs} + 1)$ (95% CI $[-0.333, 0.008]$, $p = 0.062$). The estimate is closer to the conventional significance threshold than the raw-count estimate, but its confidence interval still includes zero.
+
+# %% [markdown]
+# ## Visualize the interaction
+#
+# This plot uses the log-transformed model above. It shows the model-predicted probability that a PR is bug-inducing across the observed range of prior merged PR counts. The shaded areas are 95% confidence intervals for the mean predictions.
+
+# %%
+max_experience = int(log_experience_df["prior_merged_prs"].max())
+experience_grid = np.unique(
+    np.rint(np.geomspace(1, max_experience + 1, 250) - 1).astype(int)
+)
+
+fig, (ax, interaction_ax) = plt.subplots(
+    1,
+    2,
+    figsize=(11, 5),
+    gridspec_kw={"width_ratios": [3, 1]},
+)
+colors = {0: "#4C78A8", 1: "#E45756"}
+labels = {0: "Without AI", 1: "With AI"}
+
+for is_ai in (0, 1):
+    prediction_data = pd.DataFrame(
+        {
+            "is_ai": is_ai,
+            "experience": np.log1p(experience_grid),
+        }
+    )
+    prediction = log_experience_model.get_prediction(
+        prediction_data
+    ).summary_frame(alpha=0.05)
+
+    ax.plot(
+        experience_grid,
+        100 * prediction["predicted"],
+        color=colors[is_ai],
+        linewidth=2.5,
+        label=labels[is_ai],
+    )
+    ax.fill_between(
+        experience_grid,
+        100 * prediction["ci_lower"],
+        100 * prediction["ci_upper"],
+        color=colors[is_ai],
+        alpha=0.18,
+    )
+
+ax.set_xscale("symlog", linthresh=1)
+ax.set(
+    title="Predicted bug-inducing probability",
+    xlabel="Prior merged PRs by the author in the repository (log scale)",
+    ylabel="Predicted probability of a bug-inducing PR (%)",
+)
+ax.legend(title="PR type", frameon=False)
+ax.grid(axis="y", alpha=0.25)
+
+interaction_term = "is_ai:experience"
+interaction_estimate = log_experience_model.params[interaction_term]
+interaction_ci = log_experience_model.conf_int().loc[interaction_term]
+interaction_pvalue = log_experience_model.pvalues[interaction_term]
+
+interaction_ax.errorbar(
+    interaction_estimate,
+    0,
+    xerr=[
+        [interaction_estimate - interaction_ci.iloc[0]],
+        [interaction_ci.iloc[1] - interaction_estimate],
+    ],
+    fmt="o",
+    color="#725AC1",
+    markersize=8,
+    capsize=6,
+    linewidth=2,
+)
+interaction_ax.axvline(0, color="black", linestyle="--", linewidth=1)
+interaction_ax.set(
+    title=f"Interaction term\np = {interaction_pvalue:.3f}",
+    xlabel="Coefficient (log-odds)\nwith 95% CI",
+    yticks=[],
+)
+interaction_ax.grid(axis="x", alpha=0.25)
+
+fig.suptitle("AI × Experience Interaction", fontsize=14)
+fig.tight_layout()
+plt.show()
+
+# %% [markdown]
+# **How to read the plot.** In the left panel, the vertical gap between the lines is the modeled AI/non-AI difference at a given experience level. Each line's slope shows the modeled association between experience and bug-inducing probability for that PR type. The separate confidence bands should not be used to test the interaction. The right panel shows the formal interaction estimate and its 95% confidence interval. The interval crosses zero and the interaction is not statistically significant at the 0.05 level ($p = 0.062$).
