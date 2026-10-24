@@ -9,6 +9,7 @@
 from bisect import bisect_left
 from pathlib import Path
 import urllib.request
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -39,8 +40,6 @@ def count_prior_merged_prs(pr_history):
         .to_dict()
     )
 
-    # Count only merge timestamps strictly before each PR's creation time.
-    # This excludes the current PR and earlier PRs that had not yet merged.
     return pd.Series(
         [
             bisect_left(merged_dates.get((repo, user), ()), created)
@@ -106,9 +105,8 @@ if not cohort_csv.exists():
         ignore_index=True,
     )
 
-    rq3 = pd.merge(bug_df, info_df, on=["pr_url", "pr_type", "agent"])
+    rq3 = bug_df.merge(info_df, on=["pr_url", "pr_type", "agent"])
     rq3 = rq3[rq3["agent"].isin(AGENTS)].copy()
-    rq3["is_agentic"] = (rq3["pr_type"] == "AM").astype(int)
 
     hist_cols = [
         "pr_url",
@@ -121,8 +119,8 @@ if not cohort_csv.exists():
     ]
     all_prs = pd.concat([pd.read_csv(all_prs_csvs[a], usecols=hist_cols) for a in AGENTS], ignore_index=True)
 
-    ext = all_prs["pr_url"].str.extract(PR_URL_RE)
-    all_prs["pr_key"] = ext[0].str.lower() + "#" + ext[1]
+    matches = all_prs["pr_url"].str.extract(PR_URL_RE)
+    all_prs["pr_key"] = matches[0].str.lower() + "#" + matches[1]
     all_prs["repo_lower"] = all_prs["repo_fullname"].astype(str).str.lower()
     all_prs["user_lower"] = all_prs["pr_user"].astype(str).str.lower()
     all_prs["pr_created_dt"] = pd.to_datetime(all_prs["pr_created_date"], utc=True)
@@ -135,17 +133,16 @@ if not cohort_csv.exists():
         .reset_index(drop=True)
     )
 
-    # Merges completed before this PR was created, excluding the current PR.
     unique_prs["prior_merged_prs"] = count_prior_merged_prs(unique_prs)
 
-    rq3_ext = rq3["pr_url"].str.extract(PR_URL_RE)
-    rq3["pr_key"] = rq3_ext[0].str.lower() + "#" + rq3_ext[1]
+    matches = rq3["pr_url"].str.extract(PR_URL_RE)
+    rq3["pr_key"] = matches[0].str.lower() + "#" + matches[1]
     rq3 = rq3.merge(
         unique_prs[["pr_key", "prior_merged_prs"]],
         on="pr_key",
         how="left",
     )
-    rq3["is_bug"] = np.where(rq3["is_bug_inducing"] == "BI", 100.0, 0.0)
+    rq3["is_bug"] = (rq3["is_bug_inducing"] == "BI").astype(int)
     rq3.to_csv(cohort_csv, index=False)
 
 rq3 = pd.read_csv(cohort_csv)
@@ -170,20 +167,19 @@ if rq3["repository"].isna().any():
 
 # %%
 bug_labels = pd.read_csv(bug_csv, usecols=["pr_url"])
-bug_label_repositories = bug_labels["pr_url"].str.extract(PR_URL_RE)[0].str.lower()
-human_prs = (rq3["pr_type"] == "HM").sum()
-agentic_bot_prs = ((rq3["pr_type"] == "AM") & (rq3["pr_usertype"] == "Bot")).sum()
-agentic_non_bot_prs = ((rq3["pr_type"] == "AM") & (rq3["pr_usertype"] != "Bot")).sum()
+bug_repos = bug_labels["pr_url"].str.extract(PR_URL_RE)[0].str.lower()
+agentic = rq3["pr_type"] == "AM"
+bots = rq3["pr_usertype"] == "Bot"
 
 print("Released bug-label CSV")
 print(f"  Total PRs across all five agents: {len(bug_labels):,}")
-print(f"  Unique repositories across all five agents: {bug_label_repositories.nunique():,}")
+print(f"  Unique repositories across all five agents: {bug_repos.nunique():,}")
 print()
 print("Bug-labeled cohort composition (Claude, Codex, and Cursor)")
 print(f"  Total PRs: {len(rq3):,}")
-print(f"  Human-generated PRs (HM): {human_prs:,}")
-print(f"  Agentic PRs authored by bot accounts: {agentic_bot_prs:,}")
-print(f"  Agentic PRs authored by non-bot accounts: {agentic_non_bot_prs:,}")
+print(f"  Human-generated PRs (HM): {(~agentic).sum():,}")
+print(f"  Agentic PRs authored by bot accounts: {(agentic & bots).sum():,}")
+print(f"  Agentic PRs authored by non-bot accounts: {(agentic & ~bots).sum():,}")
 print(f"  Unique repositories: {rq3['repository'].nunique():,}")
 
 # %% [markdown]
@@ -192,79 +188,81 @@ print(f"  Unique repositories: {rq3['repository'].nunique():,}")
 # Logistic regression tests whether the association between prior merged PRs and bug-inducing status differs between agentic and human PRs. Experience is the raw number of prior merged PRs, so its coefficient is the change in log-odds associated with one additional prior merged PR. This specification assumes a linear effect of the raw PR count and uses conventional standard errors.
 
 # %%
-simple_df = rq3.copy()
-simple_df["is_agentic"] = simple_df["is_agentic"].astype(int)
-simple_df["is_bug"] = (simple_df["is_bug"] > 0).astype(int)
-
-simple_df["experience"] = simple_df["prior_merged_prs"]
-
-raw_experience_model = smf.logit(
+analysis = rq3.assign(
+    is_bug=(rq3["is_bug"] > 0).astype(int),
+    experience=rq3["prior_merged_prs"],
+)
+model = smf.logit(
     "is_bug ~ is_agentic * experience",
-    data=simple_df,
+    data=analysis,
 ).fit(disp=False)
 
 term = "is_agentic:experience"
-print("Interaction coefficient:", raw_experience_model.params[term])
-print("95% confidence interval:", raw_experience_model.conf_int().loc[term].tolist())
-print("p-value:", raw_experience_model.pvalues[term])
 
 # %% [markdown]
-# **Interpretation.** The estimated interaction is $-0.0019$ log-odds per additional prior merged PR (95% CI $[-0.0048, 0.0009]$, $p = 0.185$). Because the confidence interval includes zero, the raw-count specification does not provide statistically significant evidence that the association between experience and bug-inducing status differs between agentic and human PRs.
+# ## Experience estimates by PR type
+#
+# The first two rows estimate the relationship between experience and bug-inducing status within each PR type. The interaction tests whether those relationships differ. Estimates are changes in log-odds per additional prior merged PR.
+
+# %%
+agentic_experience = model.t_test("experience + is_agentic:experience = 0")
+experience_results = pd.DataFrame(
+    [
+        ["Human PRs", model.params["experience"], model.pvalues["experience"]],
+        ["Agentic PRs", agentic_experience.effect.item(), agentic_experience.pvalue.item()],
+        ["PR type × experience", model.params[term], model.pvalues[term]],
+    ],
+    columns=["Result", "Estimate (log-odds)", "p-value"],
+).set_index("Result")
+
+experience_results.style.format({"Estimate (log-odds)": "{:.4f}", "p-value": "{:.3f}"})
+
+# %% [markdown]
+# **Interpretation.** For human PRs, prior experience has almost no estimated association with bug-inducing status ($p = 0.615$). For agentic PRs, greater experience is associated with a larger estimated reduction, although this association is not statistically significant at the 0.05 level ($p = 0.071$). The interaction is also not statistically significant ($p = 0.185$), so there is insufficient evidence that the relationship differs between human and agentic PRs.
 
 # %% [markdown]
 # ## Predicted probabilities for agentic and human PRs
 #
-# The plot shows predictions from the raw-count interaction model with 95% confidence intervals. It stops at the largest experience value observed in both cohorts, avoiding comparisons outside their common observed range.
+# The plot shows predictions from the raw-count interaction model with 95% confidence intervals. It stops at the 95th percentile of experience because a few unusually high values would otherwise stretch the graph.
 
 # %%
-max_experience = int(simple_df.groupby("is_agentic")["prior_merged_prs"].max().min())
-experience_grid = np.linspace(0, max_experience, 250)
+experience_grid = np.linspace(0, analysis["experience"].quantile(0.95))
 
 fig, ax = plt.subplots(figsize=(7, 5))
-colors = {0: "#4C78A8", 1: "#E45756"}
-human_slope_pvalue = raw_experience_model.pvalues["experience"]
-agentic_slope_pvalue = raw_experience_model.t_test(
-    "experience + is_agentic:experience = 0"
-).pvalue.item()
-labels = {
-    0: f"Human PRs (slope p = {human_slope_pvalue:.3f})",
-    1: f"Agentic PRs (slope p = {agentic_slope_pvalue:.3f})",
-}
+for is_agentic, name in [(0, "Human PRs"), (1, "Agentic PRs")]:
+    plot_data = pd.DataFrame({"is_agentic": is_agentic, "experience": experience_grid})
+    pred = model.get_prediction(plot_data).summary_frame()
 
-for is_agentic in (0, 1):
-    prediction_data = pd.DataFrame(
-        {
-            "is_agentic": is_agentic,
-            "experience": experience_grid,
-        }
-    )
-    prediction = raw_experience_model.get_prediction(prediction_data).summary_frame(alpha=0.05)
-
-    ax.plot(
+    (line,) = ax.plot(
         experience_grid,
-        100 * prediction["predicted"],
-        color=colors[is_agentic],
+        100 * pred["predicted"],
         linewidth=2.5,
-        label=labels[is_agentic],
+        label=name,
     )
     ax.fill_between(
         experience_grid,
-        100 * prediction["ci_lower"],
-        100 * prediction["ci_upper"],
-        color=colors[is_agentic],
+        100 * pred["ci_lower"],
+        100 * pred["ci_upper"],
+        color=line.get_color(),
         alpha=0.18,
     )
 
-interaction_pvalue = raw_experience_model.pvalues["is_agentic:experience"]
 ax.set(
-    title=f"PR Type × Experience Model\ninteraction p = {interaction_pvalue:.3f}",
+    title="Predicted bug-inducing probability by prior experience",
     xlabel="Prior merged PRs in the repository",
     ylabel="Predicted probability of a bug-inducing PR (%)",
 )
 ax.grid(axis="y", alpha=0.25)
 ax.legend(title="PR type", frameon=False)
-fig.tight_layout()
+fig.text(
+    0.5,
+    0.01,
+    f"PR type × prior experience interaction: p = {model.pvalues[term]:.3f}",
+    ha="center",
+    fontsize=9,
+)
+fig.tight_layout(rect=(0, 0.04, 1, 1))
 plt.show()
 
 # %% [markdown]
-# **How to read the plot.** At a given experience level, the vertical gap between the lines is the modeled difference between agentic and human PRs. Each legend p-value tests whether that cohort's experience slope differs from zero. The interaction p-value tests whether the two slopes differ from each other. Neither cohort slope is statistically significant (human PRs: $p = 0.615$; agentic PRs: $p = 0.071$), and the difference between the slopes is also not statistically significant ($p = 0.185$).
+# **How to read the plot.** At a given experience level, the vertical gap between the lines is the modeled difference between agentic and human PRs. The shaded areas are 95% confidence intervals. The interaction tests whether the relationship between prior experience and bug-inducing status differs by PR type. It is not statistically significant ($p = 0.185$).
