@@ -1,9 +1,7 @@
 # %% [markdown]
 # # Developer Experience vs. Bug-Inducing Rate in Agentic PRs
 #
-# Secondary analysis on the RQ3 dataset from Mazloomzadeh et al. ([arXiv:2607.21832](https://arxiv.org/abs/2607.21832), [GitHub repo](https://github.com/mazloomzadeh/AI-Agent-Analysis)).
-#
-# Downloaded files and the merged cohort table are cached in `data_cache/`. Delete a file there if you want to re-download or rebuild it.
+# Data source: Mazloomzadeh et al., RQ3 dataset ([arXiv:2607.21832](https://arxiv.org/abs/2607.21832), [GitHub repository](https://github.com/mazloomzadeh/AI-Agent-Analysis)). Downloaded files and the merged cohort are cached in `data_cache/`.
 
 # %%
 from bisect import bisect_left
@@ -20,6 +18,10 @@ DATA_DIR.mkdir(exist_ok=True)
 
 AGENTS = ["claude", "codex", "cursor"]
 PR_URL_RE = r"(?:repos|github\.com)/([^/]+/[^/]+)/pulls?/(\d+)"
+
+
+def format_p_value(value):
+    return "<0.001" if value < 0.001 else f"{value:.3f}"
 
 
 def get_csv(url, filename):
@@ -57,7 +59,7 @@ def count_prior_merged_prs(pr_history):
 # %% [markdown]
 # ## Download dataset files
 #
-# We exclude `copilot` and `devin` because their PRs are generally authored by bot accounts (`Copilot` and `devin-ai-integration[bot]`), so we can't track the underlying developer's prior PR history. We retain the complete balanced RQ3 sample for Claude, Codex, and Cursor, including one Claude-labeled PR authored by the `Copilot` bot account.
+# The analysis excludes `copilot` and `devin` because their bot author accounts do not identify the developer needed to calculate prior experience. The cohort includes the complete balanced RQ3 samples for Claude, Codex, and Cursor. One Claude-labeled PR has the `Copilot` bot as its author.
 
 # %%
 BASE_RAW = "https://raw.githubusercontent.com/mazloomzadeh/AI-Agent-Analysis/main"
@@ -85,9 +87,9 @@ all_prs_csvs = {
 }
 
 # %% [markdown]
-# ## Build cohort and point-in-time experience
+# ## Build the cohort and calculate prior experience
 #
-# For each PR in the selected RQ3 sample ($N = 2,154$), we use the full repo PR history (`all_prs`) to count the author's merged PRs in that repository strictly before the selected PR was created.
+# Experience is the number of PRs by the same author merged into the same repository before the selected PR's creation time. The calculation uses the full repository PR history in `all_prs`.
 
 # %%
 cohort_csv = DATA_DIR / "rq3_cohort_point_in_time.csv"
@@ -147,45 +149,18 @@ if not cohort_csv.exists():
 
 rq3 = pd.read_csv(cohort_csv)
 rq3["is_agentic"] = (rq3["pr_type"] == "AM").astype(int)
-rq3["repository"] = rq3["pr_url"].str.extract(PR_URL_RE)[0].str.lower()
-if rq3["repository"].isna().any():
-    raise ValueError("Could not extract a repository from every PR URL")
 
 # %% [markdown]
-# ## Bug-labeled cohort composition
+# ## Fit the interaction model
 #
-# The paper's initial 539 repositories are not the population represented by this
-# table. That number was obtained after the initial AIDev language and popularity
-# filters. Validation reduced it to 489 unique repositories with at least one
-# qualifying agentic PR (Table 1). The RQ3 authors then retained merged PRs,
-# balanced agentic and human PRs within repository quarters, and excluded quarters
-# that contained only one group. Their released bug-labeled CSV contains 171
-# repositories across all five agents. Our analysis additionally excludes Copilot
-# and Devin, leaving 106 unique repositories for Claude, Codex, and Cursor. The
-# paper does not provide a repository-level attrition table, so the exact reduction
-# from 489 to 171 cannot be decomposed further from the paper alone.
-
-# %%
-bug_labels = pd.read_csv(bug_csv, usecols=["pr_url"])
-bug_repos = bug_labels["pr_url"].str.extract(PR_URL_RE)[0].str.lower()
-agentic = rq3["pr_type"] == "AM"
-bots = rq3["pr_usertype"] == "Bot"
-
-print("Released bug-label CSV")
-print(f"  Total PRs across all five agents: {len(bug_labels):,}")
-print(f"  Unique repositories across all five agents: {bug_repos.nunique():,}")
-print()
-print("Bug-labeled cohort composition (Claude, Codex, and Cursor)")
-print(f"  Total PRs: {len(rq3):,}")
-print(f"  Human-generated PRs (HM): {(~agentic).sum():,}")
-print(f"  Agentic PRs authored by bot accounts: {(agentic & bots).sum():,}")
-print(f"  Agentic PRs authored by non-bot accounts: {(agentic & ~bots).sum():,}")
-print(f"  Unique repositories: {rq3['repository'].nunique():,}")
-
-# %% [markdown]
-# ## Interaction model with raw experience
+# The logistic model is `is_bug ~ is_agentic * experience`. Experience is the raw count of prior merged PRs, so its coefficient is the change in log-odds per additional PR. The model assumes a linear effect on the log-odds scale and uses the non-robust standard errors provided by `statsmodels` by default.
 #
-# Logistic regression tests whether the association between prior merged PRs and bug-inducing status differs between agentic and human PRs. Experience is the raw number of prior merged PRs, so its coefficient is the change in log-odds associated with one additional prior merged PR. This specification assumes a linear effect of the raw PR count and uses conventional standard errors.
+# $$
+# \operatorname{logit}\!\left[P(\mathrm{bug}=1)\right]
+# = \beta_0 + \beta_1 A + \beta_2 E + \beta_3(A \times E)
+# $$
+#
+# $A$ is 0 for human PRs and 1 for agentic PRs. $E$ is the number of prior merged PRs in the repository.
 
 # %%
 analysis = rq3.assign(
@@ -200,9 +175,42 @@ model = smf.logit(
 term = "is_agentic:experience"
 
 # %% [markdown]
+# ## Model coefficients
+#
+# Human PRs are the reference group. The agentic coefficient is the difference between PR types when experience is zero.
+
+# %%
+coefficient_names = {
+    "Intercept": "Intercept",
+    "is_agentic": "Agentic PR",
+    "experience": "Experience",
+    term: "Agentic PR × experience",
+}
+confidence_intervals = model.conf_int()
+coefficient_results = pd.DataFrame(
+    {
+        "Estimate": model.params,
+        "Standard error": model.bse,
+        "p-value": model.pvalues,
+        "95% CI lower": confidence_intervals[0],
+        "95% CI upper": confidence_intervals[1],
+    }
+).rename(index=coefficient_names)
+
+coefficient_results.style.format(
+    {
+        "Estimate": "{:.4f}",
+        "Standard error": "{:.4f}",
+        "p-value": format_p_value,
+        "95% CI lower": "{:.4f}",
+        "95% CI upper": "{:.4f}",
+    }
+)
+
+# %% [markdown]
 # ## Experience estimates by PR type
 #
-# The first two rows estimate the relationship between experience and bug-inducing status within each PR type. The interaction tests whether those relationships differ. Estimates are changes in log-odds per additional prior merged PR.
+# The first two rows report the experience slope within each PR type. The interaction row tests whether the slopes differ. Estimates are changes in log-odds per additional prior merged PR.
 
 # %%
 agentic_experience = model.t_test("experience + is_agentic:experience = 0")
@@ -215,15 +223,14 @@ experience_results = pd.DataFrame(
     columns=["Result", "Estimate (log-odds)", "p-value"],
 ).set_index("Result")
 
-experience_results.style.format({"Estimate (log-odds)": "{:.4f}", "p-value": "{:.3f}"})
-
-# %% [markdown]
-# **Interpretation.** For human PRs, prior experience has almost no estimated association with bug-inducing status ($p = 0.615$). For agentic PRs, greater experience is associated with a larger estimated reduction, although this association is not statistically significant at the 0.05 level ($p = 0.071$). The interaction is also not statistically significant ($p = 0.185$), so there is insufficient evidence that the relationship differs between human and agentic PRs.
+experience_results.style.format(
+    {"Estimate (log-odds)": "{:.4f}", "p-value": format_p_value}
+)
 
 # %% [markdown]
 # ## Predicted probabilities for agentic and human PRs
 #
-# The plot shows predictions from the raw-count interaction model with 95% confidence intervals. It stops at the 95th percentile of experience because a few unusually high values would otherwise stretch the graph.
+# Predictions use the raw-count interaction model and 95% confidence intervals. The x-axis ends at the 95th percentile of experience to limit the effect of extreme values on the plot scale.
 
 # %%
 experience_grid = np.linspace(0, analysis["experience"].quantile(0.95))
@@ -263,6 +270,3 @@ fig.text(
 )
 fig.tight_layout(rect=(0, 0.04, 1, 1))
 plt.show()
-
-# %% [markdown]
-# **How to read the plot.** At a given experience level, the vertical gap between the lines is the modeled difference between agentic and human PRs. The shaded areas are 95% confidence intervals. The interaction tests whether the relationship between prior experience and bug-inducing status differs by PR type. It is not statistically significant ($p = 0.185$).
